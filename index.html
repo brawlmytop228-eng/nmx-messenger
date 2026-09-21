@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>NMX Messenger</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0f172a;color:#fff;font-family:Arial,sans-serif;height:100vh}
+.app{height:100vh;max-width:700px;margin:auto;background:#1e293b;display:flex;flex-direction:column}
+header{padding:16px;background:#2563eb;display:flex;justify-content:space-between;align-items:center}
+.logo{font-size:22px;font-weight:700}.online{font-size:12px;opacity:.9}
+#messages{flex:1;overflow:auto;padding:15px;display:flex;flex-direction:column;gap:9px}
+.msg{max-width:82%;padding:10px 13px;border-radius:14px;background:#334155;align-self:flex-start}
+.msg b{display:block;font-size:12px;opacity:.75;margin-bottom:4px}.time{font-size:10px;opacity:.5;margin-left:6px}
+.system{text-align:center;font-size:12px;opacity:.55;padding:5px}
+form{display:flex;gap:8px;padding:10px;background:#0f172a}
+input{flex:1;border:0;border-radius:12px;padding:13px;font-size:16px;outline:0}
+button{border:0;border-radius:12px;background:#2563eb;color:white;padding:0 18px;font-size:20px}
+</style>
+</head>
+<body>
+<div class="app">
+<header><div class="logo">💬 NMX Messenger</div><div class="online" id="online">0 онлайн</div></header>
+<div id="messages"></div>
+<form id="form"><input id="input" autocomplete="off" placeholder="Напиши сообщение..."><button>➤</button></form>
+</div>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket=io();
+let name=localStorage.getItem("nmx_name");
+if(!name){name=prompt("Как тебя зовут?")||"Аноним";localStorage.setItem("nmx_name",name)}
+socket.emit("join",name);
+const messages=document.getElementById("messages");
+const input=document.getElementById("input");
+function add(html,cls="msg"){const d=document.createElement("div");d.className=cls;d.innerHTML=html;messages.appendChild(d);messages.scrollTop=messages.scrollHeight}
+function safe(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
+socket.on("message",m=>add(`<b>${safe(m.username)} <span class="time">${safe(m.time)}</span></b>${safe(m.text)}`));
+socket.on("system",t=>add(safe(t),"system"));
+socket.on("online",list=>document.getElementById("online").textContent=list.length+" онлайн");
+document.getElementById("form").addEventListener("submit",e=>{e.preventDefault();const t=input.value.trim();if(t){socket.emit("message",t);input.value=""}});
+</script>
+</body>
+</html>

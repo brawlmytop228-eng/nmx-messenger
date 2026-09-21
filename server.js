@@ -7,7 +7,7 @@ const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: 2e6 });
+const io = new Server(server, { maxHttpBufferSize: 3e6 });
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, "public");
@@ -21,7 +21,14 @@ app.post("/api/upload", (req, res) => {
   if (!username || !db.users[username]) return res.status(401).json({ error: "auth" });
   const rawName = decodeURIComponent(String(req.headers["x-file-name"] || "file"));
   const safeName = rawName.replace(/[\\/:*?"<>|]/g, "_").slice(0, 200) || "file";
-  const ext = (path.extname(safeName) || "").slice(0, 12);
+  let ext = (path.extname(safeName) || "").toLowerCase().slice(0, 12);
+  const mime = String(req.headers["content-type"] || "application/octet-stream");
+  if (!ext) {
+    if (mime.startsWith("image/")) ext = "." + mime.split("/")[1].split(";")[0];
+    else if (mime.startsWith("audio/")) ext = mime.includes("mp4") ? ".m4a" : mime.includes("ogg") ? ".ogg" : ".webm";
+    else if (mime.startsWith("video/")) ext = "." + mime.split("/")[1].split(";")[0];
+    else ext = ".bin";
+  }
   const fileName = crypto.randomBytes(10).toString("hex") + ext;
   const dest = path.join(UPLOADS, fileName);
   const ws = fs.createWriteStream(dest);
@@ -32,12 +39,12 @@ app.post("/api/upload", (req, res) => {
   ws.on("error", () => { if (!aborted) res.status(500).json({ error: "write" }); });
   ws.on("finish", () => {
     if (aborted) return;
-    res.json({ url: "/uploads/" + fileName, name: safeName, size, type: String(req.headers["content-type"] || "application/octet-stream") });
+    res.json({ url: "/uploads/" + fileName, name: safeName, size, type: mime });
   });
   req.pipe(ws);
 });
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "4mb" }));
 app.use(express.static(PUBLIC));
 
 let db = { users: {}, chats: {}, messages: [], sessions: {} };
@@ -109,6 +116,7 @@ function chatSummary(chat, forUser) {
     createdBy: chat.createdBy || null,
     createdAt: chat.createdAt,
     pinned: chat.pinned || [],
+    reads: chat.reads || {},
     lastMessage: last ? { id: last.id, from: last.from, text: previewOf(last), time: last.time, type: last.type } : null,
     unread: unreadCount(chat, forUser)
   };
@@ -164,7 +172,7 @@ app.get("/api/rtc-config", (req, res) => {
   res.json({ iceServers: ice });
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, app: "NMX Messenger", version: "5.1.0" }));
+app.get("/health", (req, res) => res.json({ ok: true, app: "NMX Messenger", version: "5.2.0" }));
 
 io.use((socket, next) => {
   const token = socket.handshake.auth && socket.handshake.auth.token;
@@ -349,7 +357,7 @@ io.on("connection", socket => {
     const chat = db.chats[p?.chatId];
     if (!chat || chat.type !== "group" || !chat.members.includes(username)) return;
     if (typeof p?.name === "string" && p.name.trim()) chat.name = clean(p.name).slice(0, 60);
-    if (typeof p?.avatar === "string" && p.avatar.length < 800000) chat.avatar = p.avatar;
+    if (typeof p?.avatar === "string" && p.avatar.length < 2_500_000) chat.avatar = p.avatar;
     save(); broadcastChatUpdate(chat);
   });
 
@@ -358,7 +366,7 @@ io.on("connection", socket => {
     if (!u) return;
     if (typeof p?.displayName === "string") u.displayName = clean(p.displayName).slice(0, 40) || u.username;
     if (typeof p?.bio === "string") u.bio = String(p.bio).slice(0, 200);
-    if (typeof p?.avatar === "string" && p.avatar.length < 800000) u.avatar = p.avatar;
+    if (typeof p?.avatar === "string" && p.avatar.length < 2_500_000) u.avatar = p.avatar;
     save(); broadcastUserList();
     socket.emit("profileUpdated", publicUser(u));
     Object.values(db.chats).filter(c => c.members.includes(username)).forEach(broadcastChatUpdate);
@@ -384,4 +392,4 @@ io.on("connection", socket => {
 });
 
 app.get("*", (req, res) => res.sendFile(path.join(PUBLIC, "index.html")));
-server.listen(PORT, () => console.log("NMX Messenger 5.1 running on " + PORT));
+server.listen(PORT, () => console.log("NMX Messenger 5.2 running on " + PORT));

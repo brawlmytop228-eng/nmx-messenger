@@ -1,0 +1,13 @@
+{
+  "name": "NMX Messenger",
+  "short_name": "NMX",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0e13",
+  "theme_color": "#0b0f14",
+  "lang": "ru",
+  "icons": [
+    { "src": "/bird.jpg", "sizes": "192x192", "type": "image/jpeg" },
+    { "src": "/bird.jpg", "sizes": "512x512", "type": "image/jpeg", "purpose": "any maskable" }
+  ]
+}

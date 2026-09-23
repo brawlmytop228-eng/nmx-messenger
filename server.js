@@ -7,7 +7,7 @@ const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: 3e6 });
+const io = new Server(server, { maxHttpBufferSize: 5e6, pingTimeout: 30000 });
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, "public");
@@ -15,53 +15,68 @@ const DATA = path.join(ROOT, "data.json");
 const UPLOADS = path.join(PUBLIC, "uploads");
 fs.mkdirSync(UPLOADS, { recursive: true });
 
-app.post("/api/upload", (req, res) => {
-  const token = String(req.query.token || "");
-  const username = db.sessions[token];
-  if (!username || !db.users[username]) return res.status(401).json({ error: "auth" });
-  const rawName = decodeURIComponent(String(req.headers["x-file-name"] || "file"));
-  const safeName = rawName.replace(/[\\/:*?"<>|]/g, "_").slice(0, 200) || "file";
-  let ext = (path.extname(safeName) || "").toLowerCase().slice(0, 12);
-  const mime = String(req.headers["content-type"] || "application/octet-stream");
-  if (!ext) {
-    if (mime.startsWith("image/")) ext = "." + mime.split("/")[1].split(";")[0];
-    else if (mime.startsWith("audio/")) ext = mime.includes("mp4") ? ".m4a" : mime.includes("ogg") ? ".ogg" : ".webm";
-    else if (mime.startsWith("video/")) ext = "." + mime.split("/")[1].split(";")[0];
-    else ext = ".bin";
-  }
-  const fileName = crypto.randomBytes(10).toString("hex") + ext;
-  const dest = path.join(UPLOADS, fileName);
-  const ws = fs.createWriteStream(dest);
-  let size = 0, aborted = false;
-  req.on("data", c => { size += c.length; });
-  req.on("aborted", () => { aborted = true; ws.destroy(); try { fs.unlinkSync(dest); } catch {} });
-  req.on("error", () => { aborted = true; ws.destroy(); });
-  ws.on("error", () => { if (!aborted) res.status(500).json({ error: "write" }); });
-  ws.on("finish", () => {
-    if (aborted) return;
-    res.json({ url: "/uploads/" + fileName, name: safeName, size, type: mime });
-  });
-  req.pipe(ws);
+/* ================= SECURITY HEADERS ================= */
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(self), camera=(self)");
+  next();
 });
 
-app.use(express.json({ limit: "4mb" }));
-app.use(express.static(PUBLIC));
+/* ================= RATE LIMITING ================= */
+const buckets = new Map();
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  let b = buckets.get(key);
+  if (!b || now - b.start > windowMs) { b = { start: now, count: 0 }; buckets.set(key, b); }
+  b.count++;
+  return b.count <= max;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of buckets) if (now - b.start > 120000) buckets.delete(k);
+}, 60000).unref();
 
-let db = { users: {}, chats: {}, messages: [], sessions: {} };
-try { if (fs.existsSync(DATA)) db = JSON.parse(fs.readFileSync(DATA, "utf8")); } catch (e) { console.error(e); }
-db.users ||= {}; db.chats ||= {}; db.messages ||= []; db.sessions ||= {};
+/* ================= DB ================= */
+let db = { users: {}, chats: {}, messages: [], sessions: {}, blocks: {} };
+try { if (fs.existsSync(DATA)) db = JSON.parse(fs.readFileSync(DATA, "utf8")); }
+catch (e) { console.error("[db] load error:", e.message); }
+db.users ||= {}; db.chats ||= {}; db.messages ||= []; db.sessions ||= {}; db.blocks ||= {};
+
+const messagesByChat = new Map();
+function rebuildIndex() {
+  messagesByChat.clear();
+  for (const m of db.messages) {
+    if (!messagesByChat.has(m.chatId)) messagesByChat.set(m.chatId, []);
+    messagesByChat.get(m.chatId).push(m);
+  }
+}
+rebuildIndex();
 
 const online = new Map();
 const clean = s => String(s == null ? "" : s).trim().replace(/\s+/g, " ");
 const uid = () => crypto.randomBytes(12).toString("hex");
-const save = () => { try { fs.writeFileSync(DATA, JSON.stringify(db)); } catch (e) { console.error(e); } };
-const hashPassword = (pw, salt) => crypto.scryptSync(String(pw), salt, 64).toString("hex");
-function verifyPassword(pw, salt, hash) {
+
+let saveTimer = null;
+function save() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      const tmp = DATA + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(db));
+      fs.renameSync(tmp, DATA);
+    } catch (e) { console.error("[db] save error:", e.message); }
+  }, 400);
+}
+function saveNow() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   try {
-    const a = Buffer.from(hashPassword(pw, salt), "hex");
-    const b = Buffer.from(String(hash || ""), "hex");
-    return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
-  } catch { return false; }
+    const tmp = DATA + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(db));
+    fs.renameSync(tmp, DATA);
+  } catch (e) { console.error("[db] save error:", e.message); }
 }
 
 function publicUser(u) {
@@ -77,15 +92,15 @@ function publicUser(u) {
   };
 }
 function lastMessage(chatId) {
-  for (let i = db.messages.length - 1; i >= 0; i--) if (db.messages[i].chatId === chatId) return db.messages[i];
-  return null;
+  const arr = messagesByChat.get(chatId);
+  return arr && arr.length ? arr[arr.length - 1] : null;
 }
 function unreadCount(chat, username) {
   const lastRead = (chat.reads && chat.reads[username]) || 0;
+  const arr = messagesByChat.get(chat.id) || [];
   let n = 0;
-  for (let i = db.messages.length - 1; i >= 0; i--) {
-    const m = db.messages[i];
-    if (m.chatId !== chat.id) continue;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const m = arr[i];
     if (m.time <= lastRead) break;
     if (m.from !== username) n++;
   }
@@ -97,6 +112,7 @@ function previewOf(m) {
   if (m.type === "video") return "🎥 Видео";
   if (m.type === "audio") return "🎙️ Голосовое";
   if (m.type === "file") return "📎 " + (m.name || "Файл");
+  if (m.type === "poll") return "📊 " + (m.question || "Опрос");
   return m.text || "";
 }
 function chatSummary(chat, forUser) {
@@ -117,6 +133,7 @@ function chatSummary(chat, forUser) {
     createdAt: chat.createdAt,
     pinned: chat.pinned || [],
     reads: chat.reads || {},
+    expiresIn: chat.expiresIn || 0,
     lastMessage: last ? { id: last.id, from: last.from, text: previewOf(last), time: last.time, type: last.type } : null,
     unread: unreadCount(chat, forUser)
   };
@@ -128,35 +145,79 @@ const broadcastUserList = () => io.emit("userList", Object.values(db.users).map(
 
 function makeSession(username) {
   const token = crypto.randomBytes(24).toString("hex");
-  db.sessions[token] = username;
+  db.sessions[token] = { username, createdAt: Date.now(), expiresAt: Date.now() + 90 * 24 * 3600 * 1000 };
   save();
   return token;
 }
+function getSession(token) {
+  const s = db.sessions[token];
+  if (!s) return null;
+  if (s.expiresAt && s.expiresAt < Date.now()) { delete db.sessions[token]; save(); return null; }
+  return typeof s === "string" ? { username: s } : s;
+}
 
-app.post("/api/register", (req, res) => {
-  const username = clean(req.body?.username).toLowerCase().replace(/[^a-z0-9_.-]/g, "");
-  const password = String(req.body?.password || "");
-  const displayName = clean(req.body?.displayName).slice(0, 40) || username;
-  if (username.length < 3) return res.status(400).json({ error: "Имя минимум 3 символа" });
-  if (password.length < 4) return res.status(400).json({ error: "Пароль минимум 4 символа" });
-  if (db.users[username]) return res.status(400).json({ error: "Такой пользователь уже существует" });
-  const salt = crypto.randomBytes(16).toString("hex");
-  db.users[username] = {
-    username, displayName, bio: "", avatar: "/bird.jpg",
-    passwordHash: hashPassword(password, salt), salt, createdAt: Date.now(), lastSeen: null
-  };
-  const token = makeSession(username);
-  save(); broadcastUserList();
-  res.json({ token, user: publicUser(db.users[username]) });
+/* ================= UPLOAD ================= */
+app.post("/api/upload", (req, res) => {
+  const ip = req.ip || "?";
+  if (!rateLimit("upload:" + ip, 30, 60000)) return res.status(429).json({ error: "Слишком часто" });
+  const token = String(req.query.token || "");
+  const sess = getSession(token);
+  const username = sess && sess.username;
+  if (!username || !db.users[username]) return res.status(401).json({ error: "auth" });
+  const rawName = decodeURIComponent(String(req.headers["x-file-name"] || "file"));
+  const safeName = rawName.replace(/[\\/:*?"<>|]/g, "_").slice(0, 200) || "file";
+  let ext = (path.extname(safeName) || "").toLowerCase().slice(0, 12);
+  const mime = String(req.headers["content-type"] || "application/octet-stream");
+  if (!ext) {
+    if (mime.startsWith("image/")) ext = "." + mime.split("/")[1].split(";")[0];
+    else if (mime.startsWith("audio/")) ext = mime.includes("mp4") ? ".m4a" : mime.includes("ogg") ? ".ogg" : ".webm";
+    else if (mime.startsWith("video/")) ext = "." + mime.split("/")[1].split(";")[0];
+    else ext = ".bin";
+  }
+  const fileName = crypto.randomBytes(10).toString("hex") + ext;
+  const dest = path.join(UPLOADS, fileName);
+  const ws = fs.createWriteStream(dest);
+  let size = 0, aborted = false;
+  req.on("data", c => {
+    size += c.length;
+    if (size > 4e6) { aborted = true; ws.destroy(); try { fs.unlinkSync(dest); } catch {} req.destroy(); }
+  });
+  req.on("aborted", () => { aborted = true; ws.destroy(); try { fs.unlinkSync(dest); } catch {} });
+  req.on("error", () => { aborted = true; ws.destroy(); });
+  ws.on("error", () => { if (!aborted) res.status(500).json({ error: "write" }); });
+  ws.on("finish", () => {
+    if (aborted) return;
+    res.json({ url: "/uploads/" + fileName, name: safeName, size, type: mime });
+  });
+  req.pipe(ws);
 });
 
+app.use(express.json({ limit: "4mb" }));
+app.use(express.static(PUBLIC));
+
+/* ================= LOGIN (только username) ================= */
 app.post("/api/login", (req, res) => {
-  const username = clean(req.body?.username).toLowerCase();
-  const password = String(req.body?.password || "");
-  const u = db.users[username];
-  if (!u || !u.passwordHash) return res.status(400).json({ error: "Неверное имя или пароль" });
-  if (!verifyPassword(password, u.salt, u.passwordHash)) return res.status(400).json({ error: "Неверное имя или пароль" });
-  res.json({ token: makeSession(username), user: publicUser(u) });
+  const ip = req.ip || "?";
+  if (!rateLimit("login:" + ip, 30, 60000)) return res.status(429).json({ error: "Слишком часто, подожди минуту" });
+  const username = clean(req.body?.username).toLowerCase().replace(/[^a-z0-9_.-]/g, "");
+  if (username.length < 3) return res.status(400).json({ error: "Username минимум 3 символа (a-z, 0-9, _ . -)" });
+  if (username.length > 24) return res.status(400).json({ error: "Username максимум 24 символа" });
+  let u = db.users[username];
+  let isNew = false;
+  if (!u) {
+    u = db.users[username] = {
+      username,
+      displayName: username,
+      bio: "",
+      avatar: "/bird.jpg",
+      createdAt: Date.now(),
+      lastSeen: null
+    };
+    isNew = true;
+  }
+  const token = makeSession(username);
+  if (isNew) { saveNow(); broadcastUserList(); }
+  res.json({ token, user: publicUser(u), isNew });
 });
 
 app.post("/api/logout", (req, res) => {
@@ -165,23 +226,87 @@ app.post("/api/logout", (req, res) => {
   res.json({ ok: true });
 });
 
+app.delete("/api/account", (req, res) => {
+  const sess = getSession(String(req.body?.token || ""));
+  if (!sess) return res.status(401).json({ error: "auth" });
+  const username = sess.username;
+  delete db.users[username];
+  for (const token in db.sessions) if (db.sessions[token].username === username) delete db.sessions[token];
+  for (const id in db.chats) {
+    const c = db.chats[id];
+    c.members = c.members.filter(m => m !== username);
+    if (!c.members.length) { delete db.chats[id]; messagesByChat.delete(id); }
+  }
+  db.messages = db.messages.filter(m => m.from !== username);
+  rebuildIndex();
+  db.blocks[username] = [];
+  for (const k in db.blocks) db.blocks[k] = (db.blocks[k] || []).filter(x => x !== username);
+  saveNow(); broadcastUserList();
+  res.json({ ok: true });
+});
+
 app.get("/api/rtc-config", (req, res) => {
-  const ice = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
+  const ice = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
+  ];
   if (process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL)
     ice.push({ urls: process.env.TURN_URL, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
   res.json({ iceServers: ice });
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, app: "NMX Messenger", version: "5.2.0" }));
+app.get("/health", (req, res) => res.json({ ok: true, app: "NMX Messenger", version: "6.0.0" }));
 
+/* ================= SOCKET AUTH ================= */
 io.use((socket, next) => {
   const token = socket.handshake.auth && socket.handshake.auth.token;
-  const username = token && db.sessions[token];
-  if (!username || !db.users[username]) return next(new Error("unauthorized"));
-  socket.data.username = username;
+  const sess = token && getSession(token);
+  if (!sess || !db.users[sess.username]) return next(new Error("unauthorized"));
+  socket.data.username = sess.username;
   next();
 });
 
+/* ================= SCHEDULED / DISAPPEARING ================= */
+function deliverMessage(m) {
+  db.messages.push(m);
+  if (!messagesByChat.has(m.chatId)) messagesByChat.set(m.chatId, []);
+  messagesByChat.get(m.chatId).push(m);
+  const chat = db.chats[m.chatId];
+  if (chat) { emitToChat(chat, "message", m); broadcastChatUpdate(chat); }
+}
+setInterval(() => {
+  const now = Date.now();
+  let changed = false;
+  const toDelete = [];
+  for (const m of db.messages) {
+    if (m.expiresAt && m.expiresAt < now) toDelete.push(m);
+    if (!m.expiresAt && m.time) {
+      const chat = db.chats[m.chatId];
+      if (chat && chat.expiresIn > 0 && now - m.time > chat.expiresIn) {
+        m.expiresAt = m.time + chat.expiresIn;
+      }
+    }
+  }
+  for (const m of toDelete) {
+    const chat = db.chats[m.chatId];
+    db.messages = db.messages.filter(x => x.id !== m.id);
+    const arr = messagesByChat.get(m.chatId);
+    if (arr) { const i = arr.findIndex(x => x.id === m.id); if (i >= 0) arr.splice(i, 1); }
+    if (chat) emitToChat(chat, "messageDeleted", { chatId: m.chatId, id: m.id, reason: "expired" });
+    changed = true;
+  }
+  const scheduled = db.messages.filter(m => m.scheduledAt && m.scheduledAt <= now && !m._sent);
+  for (const m of scheduled) {
+    m._sent = true;
+    m.time = now;
+    delete m.scheduledAt;
+    const chat = db.chats[m.chatId];
+    if (chat) { emitToChat(chat, "message", m); broadcastChatUpdate(chat); changed = true; }
+  }
+  if (changed) save();
+}, 5000).unref();
+
+/* ================= SOCKET ================= */
 io.on("connection", socket => {
   const username = socket.data.username;
   socket.join("u:" + username);
@@ -192,47 +317,116 @@ io.on("connection", socket => {
     me: publicUser(db.users[username]),
     users: Object.values(db.users).map(publicUser).filter(Boolean),
     chats: userChats(username),
-    online: [...online.keys()]
+    online: [...online.keys()],
+    blocked: db.blocks[username] || []
   });
   io.emit("presence", [...online.keys()]);
   broadcastUserList();
 
-  socket.on("loadMessages", chatId => {
+  socket.on("loadMessages", (p, cb) => {
+    const chatId = typeof p === "string" ? p : p?.chatId;
+    const before = typeof p === "object" ? p.before : null;
+    const limit = typeof p === "object" && p.limit ? Math.min(p.limit, 200) : 100;
     const chat = db.chats[chatId];
-    if (!chat || !chat.members.includes(username)) return;
-    socket.emit("chatMessages", { chatId, messages: db.messages.filter(m => m.chatId === chatId).slice(-500) });
+    if (!chat || !chat.members.includes(username)) return typeof cb === "function" && cb({ error: "no" });
+    const arr = messagesByChat.get(chatId) || [];
+    let slice;
+    if (before) {
+      const i = arr.findIndex(m => m.id === before);
+      slice = i > 0 ? arr.slice(Math.max(0, i - limit), i) : [];
+    } else {
+      slice = arr.slice(-limit);
+    }
+    const hasMore = arr.length > (before ? (arr.findIndex(m => m.id === before) || 0) : slice.length);
+    if (typeof cb === "function") cb({ chatId, messages: slice, hasMore });
+    else socket.emit("chatMessages", { chatId, messages: slice, hasMore });
   });
 
-  socket.on("sendMessage", p => {
+  socket.on("searchMessages", ({ chatId, q }, cb) => {
+    if (!rateLimit("search:" + username, 60, 60000)) return typeof cb === "function" && cb({ error: "Слишком часто" });
+    const arr = messagesByChat.get(chatId) || [];
+    const query = String(q || "").toLowerCase().slice(0, 100);
+    if (!query) return typeof cb === "function" && cb({ results: [] });
+    const results = arr.filter(m => (m.text || "").toLowerCase().includes(query)).slice(-50);
+    if (typeof cb === "function") cb({ results });
+  });
+
+  socket.on("sendMessage", (p, cb) => {
+    if (!rateLimit("msg:" + username, 30, 10000)) return typeof cb === "function" && cb({ error: "Слишком часто" });
     const chat = db.chats[p?.chatId];
-    if (!chat || !chat.members.includes(username)) return;
+    if (!chat || !chat.members.includes(username)) return typeof cb === "function" && cb({ error: "no" });
     const text = String(p?.text || "").trim().slice(0, 4000);
-    if (!text) return;
+    if (!text) return typeof cb === "function" && cb({ error: "empty" });
     const m = {
       id: uid(), chatId: chat.id, from: username, text, type: "text", time: Date.now(),
       replyTo: p?.replyTo || null, forwarded: p?.forwarded || false, reactions: {}
     };
-    db.messages.push(m);
-    if (db.messages.length > 30000) db.messages = db.messages.slice(-30000);
-    save(); emitToChat(chat, "message", m); broadcastChatUpdate(chat);
+    if (p?.scheduledAt && p.scheduledAt > Date.now() + 2000) {
+      m.scheduledAt = p.scheduledAt; m._sent = false;
+      db.messages.push(m);
+      if (!messagesByChat.has(chat.id)) messagesByChat.set(chat.id, []);
+      messagesByChat.get(chat.id).push(m);
+      save();
+      return typeof cb === "function" && cb({ ok: true, scheduled: true });
+    }
+    deliverMessage(m);
+    save();
+    typeof cb === "function" && cb({ ok: true, message: m });
   });
 
-  socket.on("sendMedia", p => {
+  socket.on("sendMedia", (p, cb) => {
     const chat = db.chats[p?.chatId];
-    if (!chat || !chat.members.includes(username)) return;
+    if (!chat || !chat.members.includes(username)) return typeof cb === "function" && cb({ error: "no" });
     const url = String(p?.url || "");
-    if (!/^\/uploads\/[a-zA-Z0-9._-]+$/.test(url)) return;
+    if (!/^\/uploads\/[a-zA-Z0-9._-]+$/.test(url)) return typeof cb === "function" && cb({ error: "url" });
     const type = ["image", "video", "audio", "file"].includes(p?.type) ? p.type : "file";
     const m = {
       id: uid(), chatId: chat.id, from: username,
       text: String(p?.caption || "").slice(0, 2000), type, url,
       name: String(p?.name || "file").slice(0, 200),
       size: Number(p?.size) || 0, mime: String(p?.mime || "").slice(0, 120),
+      thumb: typeof p?.thumb === "string" && p.thumb.length < 200000 ? p.thumb : null,
       time: Date.now(), replyTo: p?.replyTo || null, forwarded: p?.forwarded || false, reactions: {}
     };
-    db.messages.push(m);
-    if (db.messages.length > 30000) db.messages = db.messages.slice(-30000);
-    save(); emitToChat(chat, "message", m); broadcastChatUpdate(chat);
+    deliverMessage(m);
+    save();
+    typeof cb === "function" && cb({ ok: true, message: m });
+  });
+
+  socket.on("sendPoll", (p, cb) => {
+    const chat = db.chats[p?.chatId];
+    if (!chat || !chat.members.includes(username)) return typeof cb === "function" && cb({ error: "no" });
+    const question = String(p?.question || "").trim().slice(0, 300);
+    const options = (Array.isArray(p?.options) ? p.options : []).map(o => String(o).trim().slice(0, 100)).filter(Boolean).slice(0, 10);
+    if (!question || options.length < 2) return typeof cb === "function" && cb({ error: "Нужен вопрос и минимум 2 варианта" });
+    const m = {
+      id: uid(), chatId: chat.id, from: username, type: "poll",
+      question, options, votes: options.map(() => []),
+      multiple: !!p?.multiple,
+      time: Date.now(), replyTo: null, forwarded: false, reactions: {}
+    };
+    deliverMessage(m);
+    save();
+    typeof cb === "function" && cb({ ok: true, message: m });
+  });
+
+  socket.on("vote", ({ messageId, optionIndex }, cb) => {
+    const m = db.messages.find(x => x.id === messageId);
+    if (!m || m.type !== "poll") return;
+    const chat = db.chats[m.chatId];
+    if (!chat || !chat.members.includes(username)) return;
+    const i = Number(optionIndex);
+    if (!m.votes || !m.votes[i]) return;
+    if (m.multiple) {
+      const list = m.votes[i];
+      const idx = list.indexOf(username);
+      if (idx >= 0) list.splice(idx, 1); else list.push(username);
+    } else {
+      m.votes = m.votes.map((list, j) => j === i ? (list.includes(username) ? [] : [username]) : list.filter(u => u !== username));
+    }
+    save();
+    emitToChat(chat, "messagePoll", { id: m.id, chatId: chat.id, votes: m.votes });
+    typeof cb === "function" && cb({ ok: true });
   });
 
   socket.on("editMessage", p => {
@@ -252,6 +446,8 @@ io.on("connection", socket => {
     if (!chat) return;
     if (m.from !== username && chat.createdBy !== username) return;
     db.messages = db.messages.filter(x => x.id !== id);
+    const arr = messagesByChat.get(m.chatId);
+    if (arr) { const i = arr.findIndex(x => x.id === id); if (i >= 0) arr.splice(i, 1); }
     if (chat.pinned) chat.pinned = chat.pinned.filter(x => x !== id);
     save();
     emitToChat(chat, "messageDeleted", { chatId: chat.id, id });
@@ -300,6 +496,15 @@ io.on("connection", socket => {
     chat.members.forEach(m => io.to("u:" + m).emit("chatRead", { chatId, username, time: chat.reads[username] }));
   });
 
+  socket.on("setDisappear", ({ chatId, ms }) => {
+    const chat = db.chats[chatId];
+    if (!chat || !chat.members.includes(username)) return;
+    chat.expiresIn = Math.max(0, Number(ms) || 0);
+    save();
+    broadcastChatUpdate(chat);
+    emitToChat(chat, "disappearChanged", { chatId, ms: chat.expiresIn });
+  });
+
   socket.on("createChat", p => {
     const members = Array.isArray(p?.members) ? p.members.map(clean).filter(Boolean) : [];
     const name = clean(p?.name).slice(0, 60);
@@ -337,7 +542,7 @@ io.on("connection", socket => {
     if (!chat || chat.type !== "group") return;
     if (chat.createdBy !== username && p?.username !== username) return;
     chat.members = chat.members.filter(m => m !== p?.username);
-    if (!chat.members.length) { delete db.chats[chat.id]; db.messages = db.messages.filter(m => m.chatId !== chat.id); save(); return; }
+    if (!chat.members.length) { delete db.chats[chat.id]; messagesByChat.delete(chat.id); db.messages = db.messages.filter(m => m.chatId !== chat.id); save(); return; }
     save();
     io.to("u:" + p.username).emit("chatRemoved", chat.id);
     broadcastChatUpdate(chat);
@@ -347,7 +552,7 @@ io.on("connection", socket => {
     const chat = db.chats[chatId];
     if (!chat || !chat.members.includes(username)) return;
     chat.members = chat.members.filter(m => m !== username);
-    if (!chat.members.length) { delete db.chats[chat.id]; db.messages = db.messages.filter(m => m.chatId !== chat.id); }
+    if (!chat.members.length) { delete db.chats[chat.id]; messagesByChat.delete(chat.id); db.messages = db.messages.filter(m => m.chatId !== chat.id); }
     save();
     socket.emit("chatRemoved", chatId);
     if (db.chats[chat.id]) broadcastChatUpdate(chat);
@@ -372,9 +577,33 @@ io.on("connection", socket => {
     Object.values(db.chats).filter(c => c.members.includes(username)).forEach(broadcastChatUpdate);
   });
 
+  socket.on("blockUser", ({ username: target, block }, cb) => {
+    const t = clean(target);
+    if (!db.users[t] || t === username) return typeof cb === "function" && cb({ error: "no" });
+    db.blocks[username] ||= [];
+    const i = db.blocks[username].indexOf(t);
+    if (block && i < 0) db.blocks[username].push(t);
+    if (!block && i >= 0) db.blocks[username].splice(i, 1);
+    save();
+    socket.emit("blockList", db.blocks[username]);
+    typeof cb === "function" && cb({ ok: true, list: db.blocks[username] });
+  });
+
+  socket.on("exportChat", ({ chatId }, cb) => {
+    const chat = db.chats[chatId];
+    if (!chat || !chat.members.includes(username)) return typeof cb === "function" && cb({ error: "no" });
+    const arr = messagesByChat.get(chatId) || [];
+    typeof cb === "function" && cb({
+      chat: { id: chat.id, name: chat.name, type: chat.type, members: chat.members },
+      messages: arr,
+      exportedAt: Date.now()
+    });
+  });
+
   const relay = ev => socket.on(ev, p => {
     const to = clean(p?.to);
     if (!to || !db.users[to]) return;
+    if ((db.blocks[to] || []).includes(username)) return;
     io.to("u:" + to).emit(ev, Object.assign({}, p, { from: username }));
   });
   ["call:invite", "call:signal", "call:end", "call:busy", "call:accept", "call:decline"].forEach(relay);
@@ -392,4 +621,10 @@ io.on("connection", socket => {
 });
 
 app.get("*", (req, res) => res.sendFile(path.join(PUBLIC, "index.html")));
-server.listen(PORT, () => console.log("NMX Messenger 5.2 running on " + PORT));
+
+server.listen(PORT, () => console.log("NMX Messenger 6.0 running on " + PORT));
+
+process.on("SIGTERM", () => { console.log("SIGTERM"); saveNow(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000); });
+process.on("SIGINT", () => { console.log("SIGINT"); saveNow(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000); });
+process.on("uncaughtException", e => { console.error("uncaught:", e); saveNow(); });
+process.on("unhandledRejection", e => { console.error("unhandled:", e); });
